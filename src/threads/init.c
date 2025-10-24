@@ -134,6 +134,57 @@ pintos_init (void)
     run_actions (argv);
   } else {
     // TODO: no command line passed to kernel. Run interactively 
+    while (true)
+    {
+      printf("CS2043@pintos> ");
+
+      char user_input[20];
+      int track_of_position = 0;
+
+      while(true){
+        char letter = input_getc();
+        // putchar(letter);
+        printf("%c",letter);
+        if(letter == '\r'){
+          user_input[track_of_position] = '\0';
+          break;
+        }
+        if(letter == '\b' || letter == 127){
+          // printf("_");
+          if(track_of_position>0){
+            track_of_position--;
+            printf("\b \b");
+            // continue;
+          }
+        }
+        else{
+          user_input[track_of_position] = letter;
+          track_of_position++;
+        }
+        
+      }
+
+      if(strcmp(user_input, "whoami")==0){
+        printf("sheron230286k@pintos\n");
+      }
+      else if(strcmp(user_input, "shutdown")==0){
+        printf("Shutting Down...\n");
+        shutdown_power_off();
+      }
+      else if (strcmp(user_input, "time") == 0)
+          printf("\nNumber of seconds passed since Unix epoch is %lu \n",rtc_get_time());
+      else if (strcmp(user_input, "ram") == 0)
+          printf("Available RAM for OS is %u KB\n",init_ram_pages *PGSIZE/1024);
+      else if(strcmp(user_input, "thread") == 0)
+          thread_print_stats();
+      else if(strcmp(user_input, "priority") == 0)
+          printf("Priority of the current thread is %d\n",thread_get_priority());
+      else if (strcmp(user_input,"exit") == 0) {
+          printf("Exiting Shell...\n");
+          break;
+      }
+    }
+    
   }
 
   /* Finish up. */
