@@ -436,6 +436,14 @@ running_thread (void)
      always at the beginning of a page and the stack pointer is
      somewhere in the middle, this locates the curent thread. */
   asm ("mov %%esp, %0" : "=g" (esp));
+#ifdef USERPROG
+  list_init (&t->file_list);
+  list_init (&t->children);
+  t->next_fd = 2;
+  t->wait_status = NULL;
+  t->exit_status = 0;
+  t->executable = NULL;
+#endif
   return pg_round_down (esp);
 }
 
