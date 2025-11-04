@@ -1,0 +1,301 @@
+		     +--------------------------+
+       	       	     |		CS 318		|
+		     | PROJECT 2: USER PROGRAMS	|
+		     | 	   DESIGN DOCUMENT     	|
+		     +--------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Name : Sheron Jayasinghe
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course staff.
+
+			   ARGUMENT PASSING
+			   ================
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed struct or struct member, 
+global or static variable, typedef, or enumeration. Identify the purpose of each in 25 words or less.
+
+No new structures were added for argument passing specifically. 
+The implementation uses local variables in the setup_stack function to parse and push arguments onto the user stack.
+
+---- ALGORITHMS ----
+
+
+>> A2: Briefly describe how you implemented argument parsing. 
+How do you arrange for the elements of argv[] to be in the right order? 
+How do you avoid overflowing the stack page?**
+
+In the load function first we parse the program name from the full command line using strtok_r to extract just the executable name. 
+This is needed to open the correct file.
+Then in setup_stack function we do the actual argument parsing. 
+We make a copy of the full command line and use strtok_r again to split it into individual arguments by spaces. 
+We store pointers to each argument in an argv array (max 128 arguments).
+To push arguments in correct order we do it in reverse - we loop through argv backwards pushing each string onto the stack. 
+This way when we push the pointers later they point to the right addresses. 
+After pushing all the strings we align the stack pointer to 4 bytes by adding padding if needed.
+
+Then we push a null pointer sentinel, then push all the argument pointers in reverse order, then push argv (pointer to the array), 
+then push argc (count), and finally a fake return address.
+
+To avoid overflow we limit to max 128 arguments and check if malloc fails when allocating the command copy. 
+The stack page is 4KB so this should be enough for most cases but we dont explicitly check the total size.
+
+---- RATIONALE ----
+
+>> A3: Why does Pintos implement strtok_r() but not strtok()?**
+
+strtok_r is reentrant which means its thread safe because it uses a save_ptr parameter to 
+keep track of where it is in the string instead of using a static variable like strtok does. 
+In pintos we have multiple threads running at same time so if we used strtok two threads could interfere with each others parsing. 
+strtok_r avoids this by letting each thread maintain its own position.
+
+>> A4: In Pintos, the kernel separates commands into a executable name and arguments. 
+In Unix-like systems, the shell does this separation. Identify at least two advantages of the Unix approach.**
+
+First advantage is security - the shell runs in user mode so if theres a bug in parsing it cant crash the kernel or compromise system security. 
+In pintos if our parsing code has a bug it could cause kernel panic.
+
+Second advantage is flexibility - in unix different shells can implement different parsing rules like handling quotes or wildcards 
+or special characters differently. Users can choose which shell to use. 
+In pintos the parsing is fixed in kernel so everyone has to use same rules and its harder to change or extend.
+
+			     SYSTEM CALLS
+			     ============
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed struct or struct member, global or static variable, 
+typedef, or enumeration. Identify the purpose of each in 25 words or less.**
+
+In thread.h we added to struct thread:
+```c
+struct thread *parent;           // Parent process pointer
+struct list children;            // List of child processes  
+struct list_elem child_elem;     // Element for parents children list
+
+struct semaphore wait_sema;      // For parent waiting on child exit
+struct semaphore load_sema;      // For waiting on load completion
+bool load_ok;                    // Whether load was successful
+
+int exit_status;                 // Exit status to return to parent
+bool waited;                     // Whether parent has waited on this child
+
+struct file *exe_file;           // Executable file to deny writes
+struct file **fd_tbl;            // File descriptor table (dynamic array)
+int fd_max;                      // Size of fd table
+```
+
+In syscall.c we added:
+```c
+static struct lock fs_lock;      // Lock for file system operations
+```
+
+>> B2: Describe how file descriptors are associated with open files. 
+Are file descriptors unique within the entire OS or just within a single process?**
+
+File descriptors are unique per process not OS wide. Each process has its own fd_tbl which is a dynamic array of file pointers. 
+When a file is opened we find the next available fd starting from 2 (since 0 and 1 are stdin/stdout) 
+and store the file pointer at that index in the array.
+
+The fd is just the index into this array. So fd 3 in process A points to a different file than fd 3 in process B 
+because they have separate tables. This is good because child processes can have their own files open without conflicting with parent.
+
+If the table fills up we use realloc to double its size so we can keep adding more fds.
+
+---- ALGORITHMS ----
+
+>> B3: Describe your code for reading and writing user data from the kernel.**
+
+We have three helper functions in syscall.c for validating user pointers:
+
+check_ptr checks a single pointer - it verifies the pointer is not null, is in user address space using is_user_vaddr, 
+and has a valid mapping using pagedir_get_page. If any check fails we set exit status to -1 and call thread_exit.
+
+check_buf checks a buffer by calling check_ptr on every byte in the buffer range. This ensures the entire buffer is valid.
+
+check_str checks a string by calling check_ptr on each character until we hit the null terminator.
+
+Before any syscall accesses user memory we call these functions. 
+For example in the write syscall we check the buffer pointer and size before calling file_write. 
+If validation fails the process exits with status -1.
+
+>> B4: Suppose a system call causes a full page (4,096 bytes) of data to be copied from user space into the kernel. 
+What is the least and the greatest possible number of inspections of the page table (e.g. calls to pagedir_get_page()) that might result? 
+What about for a system call that only copies 2 bytes of data? Is there room for improvement in these numbers, and how much?**
+
+For 4096 bytes:
+- Best case: 1 inspection if the entire buffer is on a single page thats already been checked
+- Worst case: 4096 inspections because our check_buf function checks every single byte so it calls pagedir_get_page 4096 times
+
+For 2 bytes:
+- Best case: 1 inspection  
+- Worst case: 2 inspections (one per byte)
+
+There is definitely room for improvement. We could check just the first and last address of the buffer and maybe the page boundaries in between. 
+For a 4KB buffer that spans 2 pages we would only need 2 checks instead of 4096. 
+This would be much faster but we would need to be careful about buffers that span multiple pages.
+
+>> B5: Briefly describe your implementation of the "wait" system call and how it interacts with process termination.**
+
+The wait system call calls process_wait with the child tid. 
+In process_wait we first search through the current threads children list to find the child with matching tid. 
+If we dont find it or if we already waited on it we return -1.
+
+When we find the child we remove it from the children list right away to avoid dangling pointers. 
+Then we call sema_down on the childs wait_sema which blocks until the child exits.
+
+When a child process exits in process_exit it calls sema_up on its wait_sema which wakes up the parent. 
+The parent then reads the childs exit_status and sets the waited flag to true. This tells the kernel its ok to free the childs thread structure now.
+
+The key synchronization is the wait_sema - it makes sure the parent waits until child is done, 
+and the waited flag makes sure the child structure isnt freed until parent reads the exit status.
+
+>> B6: Any access to user program memory at a user-specified address can fail due to a bad pointer value. 
+Such accesses must cause the process to be terminated. System calls are fraught with such accesses, 
+e.g. a "write" system call requires reading the system call number from the user stack, then each of the call's three arguments, 
+then an arbitrary amount of user memory, and any of these can fail at any point. 
+This poses a design and error-handling problem: how do you best avoid obscuring the primary function of code in a morass of error-handling? 
+Furthermore, when an error is detected, how do you ensure that all temporarily allocated resources (locks, buffers, etc.) are freed? 
+In a few paragraphs, describe the strategy or strategies you adopted for managing these issues. Give an example.**
+
+We used a validate-early strategy where we check all user pointers at the start of each syscall before doing any real work. 
+This keeps the validation code separate from the main logic.
+
+The check_ptr, check_buf and check_str functions handle all validation in one place. 
+They immediately call thread_exit if validation fails which means we dont need error handling code scattered everywhere. 
+The main syscall code can assume all pointers are valid after the checks.
+
+For resource management when an error occurs, calling thread_exit automatically triggers process_exit which 
+cleans everything up - closes all file descriptors, releases locks, closes the executable file etc. We dont need manual cleanup in each syscall.
+
+For example in the write syscall we first check the fd, buffer pointer and size. 
+Only after all checks pass do we acquire the fs_lock and call file_write. 
+If any validation fails we exit immediately and process_exit cleans up any resources the process had. 
+If we already acquired a lock before failing we would have a problem but we designed it so validation happens first.
+
+One edge case is if a page fault happens during actual data copy (not during validation). 
+The page fault handler catches this and calls thread_exit with exit_status -1 which again triggers cleanup.
+
+---- SYNCHRONIZATION ----
+
+>> B7: The "exec" system call returns -1 if loading the new executable fails, 
+so it cannot return before the new executable has completed loading. How does your code ensure this? 
+How is the load success/failure status passed back to the thread that calls "exec"?**
+
+In process_execute after creating the child thread we call thread_get_by_tid to get a pointer to the child thread structure. 
+Then we call sema_down on the childs load_sema. This blocks the parent until the child finishes loading.
+
+In the childs start_process function after calling load we set the load_ok boolean to true or false depending on whether load succeeded. 
+Then we call sema_up on load_sema which wakes up the parent.
+
+The parent checks the childs load_ok flag after waking up. If its false we return TID_ERROR (-1) to indicate exec failed. 
+Otherwise we return the child tid.
+
+This ensures exec cant return until load is done and the success status is communicated through the load_ok flag in the child thread structure.
+
+>> B8: Consider parent process P with child process C. 
+How do you ensure proper synchronization and avoid race conditions when P calls wait(C) before C exits? After C exits? 
+How do you ensure that all resources are freed in each case? How about when P terminates without waiting, before C exits? 
+After C exits? Are there any special cases?**
+
+Case 1: P calls wait before C exits
+- P finds C in children list and removes it
+- P calls sema_down on C.wait_sema and blocks
+- C eventually exits and calls sema_up on wait_sema  
+- P wakes up, reads exit_status, sets waited=true
+- Later when another thread runs C's structure is freed in thread_schedule_tail
+
+Case 2: P calls wait after C exits
+- C has already called sema_up on wait_sema
+- P finds C in children list and removes it
+- P calls sema_down which returns immediately since count is 1
+- P reads exit_status and sets waited=true
+- C's structure gets freed later
+
+Case 3: P terminates without waiting before C exits
+- P exits and gets freed
+- C keeps running with a parent pointer to freed memory but doesnt use it
+- C exits normally but no one is waiting so wait_sema just increments
+- C's structure doesnt get freed because waited is still false
+- This causes a memory leak which is a problem but not a crash
+
+Case 4: P terminates after C exits
+- Same as case 3 but C is already dead
+- Both structures leak if P didnt wait
+
+The main issue is memory leaks when parent doesnt wait. 
+We could fix this by having process_exit clean up all children that havent been waited on but we didnt implement that.
+
+---- RATIONALE ----
+
+>> B9: Why did you choose to implement access to user memory from the kernel in the way that you did?**
+
+We chose to validate pointers by checking them before accessing rather than catching page faults because its simpler and more explicit. 
+The check_ptr function clearly shows what we're checking and why.
+
+The alternative would be to try accessing and catch page faults but that requires more complex exception handling 
+code and makes it harder to understand whats happening. Our way is slower because we check every byte but its easier to debug and understand.
+
+Also our validation catches bad pointers before we do any work so we avoid partial operations. 
+If we accessed first and caught faults later we might have already written some data or acquired locks.
+
+>> B10: What advantages or disadvantages can you see to your design for file descriptors?**
+
+Advantages:
+- Simple to implement - just an array of file pointers
+- Fast lookup - O(1) access by index
+- Easy to find next available fd by scanning array
+- Dynamic sizing means we dont waste space or run out
+
+Disadvantages:
+- If a process opens and closes lots of files the array keeps growing and never shrinks so memory usage only goes up
+- Scanning for next available fd is O(n) which could be slow if array is big
+- Have to use realloc to grow which might fail if memory is low
+- No fancy features like fd redirection or duplication
+
+Overall its a simple design that works well for most cases but could be improved for processes that churn through lots of files.
+
+>> B11: The default tid_t to pid_t mapping is the identity mapping. If you changed it, what advantages are there to your approach?**
+
+We didnt change the tid to pid mapping so they are the same thing. Each thread has a unique tid and we use that as the process id too.
+
+If we had separate pids we could do things like having multiple threads per process with 
+one shared pid or we could reuse pids after processes die. But for pintos where each process is single threaded the identity mapping 
+is simpler and works fine. Theres no need to maintain a separate mapping table or allocate pids differently.
+
+
+			   SURVEY QUESTIONS
+			   ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the quarter.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students, either for future quarters or the remaining projects?
+
+>> Any other comments?

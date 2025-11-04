@@ -331,6 +331,28 @@ thread_foreach (thread_action_func *func, void *aux)
     }
 }
 
+/* Returns the thread with the given TID, or NULL if not found. */
+struct thread *
+thread_get_by_tid (tid_t tid)
+{
+  struct list_elem *e;
+  enum intr_level old_level = intr_disable ();
+
+  for (e = list_begin (&all_list); e != list_end (&all_list);
+       e = list_next (e))
+    {
+      struct thread *t = list_entry (e, struct thread, allelem);
+      if (t->tid == tid)
+        {
+          intr_set_level (old_level);
+          return t;
+        }
+    }
+
+  intr_set_level (old_level);
+  return NULL;
+}
+
 /* Sets the current thread's priority to NEW_PRIORITY. */
 void
 thread_set_priority (int new_priority) 
@@ -464,6 +486,23 @@ init_thread (struct thread *t, const char *name, int priority)
   t->priority = priority;
   t->magic = THREAD_MAGIC;
 
+#ifdef USERPROG
+  /* Don't set parent for initial thread. */
+  if (t != initial_thread)
+    t->parent = running_thread ();
+  else
+    t->parent = NULL;
+  list_init (&t->children);
+  sema_init (&t->wait_sema, 0);
+  sema_init (&t->load_sema, 0);
+  t->load_ok = false;
+  t->exit_status = -1;
+  t->waited = false;
+  t->exe_file = NULL;
+  t->fd_tbl = NULL;
+  t->fd_max = 2;
+#endif
+
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
@@ -538,7 +577,11 @@ thread_schedule_tail (struct thread *prev)
   if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread) 
     {
       ASSERT (prev != cur);
-      palloc_free_page (prev);
+#ifdef USERPROG
+      /* Don't free if parent hasn't waited yet. */
+      if (prev->waited)
+#endif
+        palloc_free_page (prev);
     }
 }
 
