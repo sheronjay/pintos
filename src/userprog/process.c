@@ -8,6 +8,7 @@
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/tss.h"
+#include "userprog/syscall.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
 #include "filesys/filesys.h"
@@ -15,56 +16,156 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static bool setup_arguments (void **esp, char **argv, int argc);
+static void release_wait_status (struct wait_status *ws);
+
+struct exec_info
+  {
+    char *cmdline;                 /* Command line to execute. */
+    struct wait_status *wait_status; /* Parent-child synchronization state. */
+  };
+
+static void
+release_wait_status (struct wait_status *ws)
+{
+  if (ws == NULL)
+    return;
+
+  lock_acquire (&ws->lock);
+  ws->ref_cnt--;
+  int ref_cnt = ws->ref_cnt;
+  lock_release (&ws->lock);
+
+  if (ref_cnt == 0)
+    free (ws);
+}
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
 tid_t
-process_execute (const char *file_name) 
+process_execute (const char *file_name)
 {
-  char *fn_copy;
-  tid_t tid;
+  struct thread *cur = thread_current ();
+  struct exec_info *info = NULL;
+  struct wait_status *ws = NULL;
+  char *cmdline = NULL;
+  char *name_copy = NULL;
+  char *program_name = NULL;
+  tid_t tid = TID_ERROR;
 
-  /* Make a copy of FILE_NAME.
-     Otherwise there's a race between the caller and load(). */
-  fn_copy = palloc_get_page (0);
-  if (fn_copy == NULL)
+  if (file_name == NULL)
     return TID_ERROR;
-  strlcpy (fn_copy, file_name, PGSIZE);
 
-  /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  cmdline = palloc_get_page (0);
+  if (cmdline == NULL)
+    goto done;
+  strlcpy (cmdline, file_name, PGSIZE);
+
+  name_copy = palloc_get_page (0);
+  if (name_copy == NULL)
+    goto done;
+  strlcpy (name_copy, file_name, PGSIZE);
+  char *save_ptr;
+  program_name = strtok_r (name_copy, " ", &save_ptr);
+  if (program_name == NULL)
+    goto done;
+
+  ws = malloc (sizeof *ws);
+  if (ws == NULL)
+    goto done;
+  ws->tid = TID_ERROR;
+  ws->exit_code = -1;
+  ws->loaded = false;
+  ws->exited = false;
+  ws->ref_cnt = 2;
+  sema_init (&ws->wait_sema, 0);
+  sema_init (&ws->load_sema, 0);
+  lock_init (&ws->lock);
+  list_push_back (&cur->children, &ws->elem);
+
+  info = malloc (sizeof *info);
+  if (info == NULL)
+    goto done;
+  info->cmdline = cmdline;
+  info->wait_status = ws;
+
+  tid = thread_create (program_name, PRI_DEFAULT, start_process, info);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    goto done;
+  ws->tid = tid;
+  info = NULL;
+  cmdline = NULL;
+
+  /* Wait for the child to finish loading. */
+  sema_down (&ws->load_sema);
+  if (!ws->loaded)
+    {
+      list_remove (&ws->elem);
+      release_wait_status (ws);
+      tid = TID_ERROR;
+      ws = NULL;
+    }
+
+done:
+  if (tid == TID_ERROR)
+    {
+      if (info != NULL)
+        free (info);
+      if (ws != NULL && ws->tid == TID_ERROR)
+        {
+          list_remove (&ws->elem);
+          release_wait_status (ws);
+        }
+      if (cmdline != NULL)
+        palloc_free_page (cmdline);
+    }
+  if (name_copy != NULL)
+    palloc_free_page (name_copy);
   return tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
 static void
-start_process (void *file_name_)
+start_process (void *exec_info_)
 {
-  char *file_name = file_name_;
+  struct exec_info *info = exec_info_;
+  struct wait_status *ws = info->wait_status;
+  char *cmdline = info->cmdline;
   struct intr_frame if_;
   bool success;
+  struct thread *cur = thread_current ();
+
+  cur->wait_status = ws;
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  success = load (cmdline, &if_.eip, &if_.esp);
+
+  lock_acquire (&ws->lock);
+  ws->loaded = success;
+  lock_release (&ws->lock);
+  sema_up (&ws->load_sema);
 
   /* If load failed, quit. */
-  palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
+  palloc_free_page (cmdline);
+  free (info);
+  if (!success)
+    {
+      cur->exit_status = -1;
+      thread_exit ();
+    }
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -86,9 +187,32 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid)
 {
-  return -1;
+  struct thread *cur = thread_current ();
+  struct list_elem *e;
+  struct wait_status *ws = NULL;
+
+  for (e = list_begin (&cur->children); e != list_end (&cur->children); e = list_next (e))
+    {
+      struct wait_status *candidate = list_entry (e, struct wait_status, elem);
+      if (candidate->tid == child_tid)
+        {
+          ws = candidate;
+          list_remove (e);
+          break;
+        }
+    }
+
+  if (ws == NULL)
+    return -1;
+
+  sema_down (&ws->wait_sema);
+  lock_acquire (&ws->lock);
+  int status = ws->exit_code;
+  lock_release (&ws->lock);
+  release_wait_status (ws);
+  return status;
 }
 
 /* Free the current process's resources. */
@@ -97,6 +221,37 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+
+  if (cur->pagedir != NULL)
+    printf ("%s: exit(%d)\n", cur->name, cur->exit_status);
+
+  /* Notify parent if waiting. */
+  if (cur->wait_status != NULL)
+    {
+      lock_acquire (&cur->wait_status->lock);
+      cur->wait_status->exit_code = cur->exit_status;
+      cur->wait_status->exited = true;
+      lock_release (&cur->wait_status->lock);
+      sema_up (&cur->wait_status->wait_sema);
+      release_wait_status (cur->wait_status);
+      cur->wait_status = NULL;
+    }
+
+  /* Release all remaining references to children. */
+  while (!list_empty (&cur->children))
+    {
+      struct list_elem *e = list_pop_front (&cur->children);
+      struct wait_status *child_ws = list_entry (e, struct wait_status, elem);
+      release_wait_status (child_ws);
+    }
+
+  syscall_cleanup ();
+  if (cur->executable != NULL)
+    {
+      file_allow_write (cur->executable);
+      file_close (cur->executable);
+      cur->executable = NULL;
+    }
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -180,13 +335,39 @@ struct Elf32_Phdr
     Elf32_Word p_align;
   };
 
-/* Values for p_type.  See [ELF1] 2-3. */
-#define PT_NULL    0            /* Ignore. */
-#define PT_LOAD    1            /* Loadable segment. */
-#define PT_DYNAMIC 2            /* Dynamic linking info. */
-#define PT_INTERP  3            /* Name of dynamic loader. */
-#define PT_NOTE    4            /* Auxiliary info. */
-#define PT_SHLIB   5            /* Reserved. */
+load (const char *cmdline, void (**eip) (void), void **esp)
+  char *cmdline_copy = NULL;
+  char **argv = NULL;
+  int argc = 0;
+  if (t->pagedir == NULL)
+  argv = palloc_get_page (PAL_ZERO);
+  if (argv == NULL)
+    goto done;
+
+  cmdline_copy = palloc_get_page (0);
+  if (cmdline_copy == NULL)
+    goto done;
+  strlcpy (cmdline_copy, cmdline, PGSIZE);
+  char *token, *save_ptr;
+  size_t max_args = PGSIZE / sizeof *argv;
+  for (token = strtok_r (cmdline_copy, " ", &save_ptr); token != NULL;
+       token = strtok_r (NULL, " ", &save_ptr))
+    {
+      argv[argc++] = token;
+      if ((size_t) argc >= max_args)
+        goto done;
+    }
+
+  if (argc == 0)
+    goto done;
+
+  file = filesys_open (argv[0]);
+  if (file == NULL)
+      printf ("load: %s: open failed\n", argv[0]);
+      goto done;
+  t->executable = file;
+  file_deny_write (file);
+      printf ("load: %s: error loading executable\n", cmdline);
 #define PT_PHDR    6            /* Program header table. */
 #define PT_STACK   0x6474e551   /* Stack segment. */
 
@@ -278,8 +459,62 @@ load (const char *file_name, void (**eip) (void), void **esp)
               uint32_t read_bytes, zero_bytes;
               if (phdr.p_filesz > 0)
                 {
-                  /* Normal segment.
-                     Read initial part from disk and zero the rest. */
+  if (!setup_arguments (esp, argv, argc))
+    goto done;
+  if (!success && file != NULL)
+    {
+      file_close (file);
+      t->executable = NULL;
+    }
+  if (cmdline_copy != NULL)
+    palloc_free_page (cmdline_copy);
+  if (argv != NULL)
+    palloc_free_page (argv);
+
+static bool
+setup_arguments (void **esp, char **argv, int argc)
+{
+  int i;
+
+  for (i = argc - 1; i >= 0; i--)
+    {
+      size_t len = strlen (argv[i]) + 1;
+      *esp -= len;
+      memcpy (*esp, argv[i], len);
+      argv[i] = *esp;
+    }
+
+  uintptr_t esp_val = (uintptr_t) *esp;
+  esp_val &= 0xfffffffc;
+  *esp = (void *) esp_val;
+
+  *esp -= sizeof (char *);
+  char **stack_ptr = *esp;
+  *stack_ptr = NULL;
+
+  for (i = argc - 1; i >= 0; i--)
+    {
+      *esp -= sizeof (char *);
+      stack_ptr = *esp;
+      *stack_ptr = argv[i];
+    }
+
+  char **argv_start = *esp;
+  *esp -= sizeof (char **);
+  char ***argv_ptr = *esp;
+  *argv_ptr = argv_start;
+
+  *esp -= sizeof (int);
+  int *argc_ptr = *esp;
+  *argc_ptr = argc;
+
+  *esp -= sizeof (void *);
+  void **ret_addr = *esp;
+  *ret_addr = NULL;
+
+  return true;
+}
+
                   read_bytes = page_offset + phdr.p_filesz;
                   zero_bytes = (ROUND_UP (page_offset + phdr.p_memsz, PGSIZE)
                                 - read_bytes);
